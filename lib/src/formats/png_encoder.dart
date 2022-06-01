@@ -14,12 +14,13 @@ import 'encoder.dart';
 class PngEncoder extends Encoder {
   PngEncoder({this.filter = FILTER_PAETH, this.level});
 
-  void addFrame(Image image) {
+  void addFrame(Image image, {List<int>? rgbaPalette}) {
     xOffset = image.xOffset;
     yOffset = image.xOffset;
     delay = image.duration;
     disposeMethod = image.disposeMethod;
     blendMethod = image.blendMethod;
+    paletted = rgbaPalette != null;
 
     if (output == null) {
       output = OutputBuffer(bigEndian: true);
@@ -28,20 +29,26 @@ class PngEncoder extends Encoder {
       _width = image.width;
       _height = image.height;
 
-      _writeHeader(_width, _height);
+      _writeHeader(_width, _height, rgbaPalette != null);
 
       _writeICCPChunk(output, image.iccProfile);
 
       if (isAnimated) {
         _writeAnimationControlChunk();
       }
+
+      if (paletted) {
+        _writePaletteChunk(output!, rgbaPalette!);
+        _writeTransparencyChunk(output!, rgbaPalette);
+      }
     }
 
     // Include room for the filter bytes (1 byte per row).
     final filteredImage = Uint8List(
-        (image.width * image.height * image.numberOfChannels) + image.height);
+        (image.width * image.height * (paletted ? 1 : image.numberOfChannels)) +
+            image.height);
 
-    _filter(image, filteredImage);
+    _filter(image, filteredImage, paletted);
 
     final compressed = const ZLibEncoder().encode(filteredImage, level: level);
 
@@ -91,7 +98,7 @@ class PngEncoder extends Encoder {
 
   /// Encode an animation.
   @override
-  List<int>? encodeAnimation(Animation anim) {
+  List<int>? encodeAnimation(Animation anim, {List<int>? rgbaPalette}) {
     isAnimated = true;
     _frames = anim.frames.length;
     repeat = anim.loopCount;
@@ -104,13 +111,13 @@ class PngEncoder extends Encoder {
 
   /// Encode a single frame image.
   @override
-  List<int> encodeImage(Image image) {
+  List<int> encodeImage(Image image, {List<int>? rgbaPalette}) {
     isAnimated = false;
-    addFrame(image);
+    addFrame(image, rgbaPalette: rgbaPalette);
     return finish()!;
   }
 
-  void _writeHeader(int width, int height) {
+  void _writeHeader(int width, int height, bool paletted) {
     // PNG file signature
     output!.writeBytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 
@@ -119,7 +126,7 @@ class PngEncoder extends Encoder {
     chunk.writeUint32(width);
     chunk.writeUint32(height);
     chunk.writeByte(8);
-    chunk.writeByte(channels == Channels.rgb ? 2 : 6);
+    chunk.writeByte(paletted ? 3 : (channels == Channels.rgb ? 2 : 6));
     chunk.writeByte(0); // compression method
     chunk.writeByte(0); // filter method
     chunk.writeByte(0); // interlace method
@@ -175,6 +182,30 @@ class PngEncoder extends Encoder {
     _writeChunk(output!, 'iCCP', chunk.getBytes());
   }
 
+  void _writePaletteChunk(OutputBuffer out, List<int> rgbaPalette) {
+    assert(rgbaPalette.length < 256);
+    final chunk = OutputBuffer(bigEndian: true);
+    rgbaPalette
+        .expand((color) => [
+              (color & 0x000000FF),
+              (color & 0x0000FF00) >> 8,
+              (color & 0x00FF0000) >> 16,
+            ])
+        .forEach(chunk.writeByte);
+
+    _writeChunk(output!, 'PLTE', chunk.getBytes());
+  }
+
+  void _writeTransparencyChunk(OutputBuffer out, List<int> rgbaPalette) {
+    assert(rgbaPalette.length < 256);
+    final chunk = OutputBuffer(bigEndian: true);
+    rgbaPalette
+        .map((color) => (color & 0xFF000000) >> 24)
+        .forEach(chunk.writeByte);
+
+    _writeChunk(output!, 'tRNS', chunk.getBytes());
+  }
+
   void _writeChunk(OutputBuffer out, String type, List<int> chunk) {
     out.writeUint32(chunk.length);
     out.writeBytes(type.codeUnits);
@@ -183,7 +214,7 @@ class PngEncoder extends Encoder {
     out.writeUint32(crc);
   }
 
-  void _filter(Image image, List<int> out) {
+  void _filter(Image image, List<int> out, bool useBytes) {
     var oi = 0;
     for (var y = 0; y < image.height; ++y) {
       switch (filter) {
@@ -197,7 +228,11 @@ class PngEncoder extends Encoder {
           oi = _filterAverage(image, oi, y, out);
           break;
         case FILTER_PAETH:
-          oi = _filterPaeth(image, oi, y, out);
+          if (useBytes) {
+            oi = _filterPaethBytes(image, oi, y, out);
+          } else {
+            oi = _filterPaeth(image, oi, y, out);
+          }
           break;
         case FILTER_AGRESSIVE:
           // TODO Apply all five filters and select the filter that produces
@@ -369,6 +404,26 @@ class PngEncoder extends Encoder {
     return oi;
   }
 
+  int byteAt(List<int> bytes, int x, int y, int width) => bytes[y * width + x];
+
+  int _filterPaethBytes(Image image, int oi, int row, List<int> out) {
+    out[oi++] = FILTER_PAETH;
+
+    final bytes = image.getBytes();
+    for (var x = 0; x < bytes.length; ++x) {
+      final ar = (x == 0) ? 0 : byteAt(bytes, x - 1, row, image.width);
+      final br = (row == 0) ? 0 : byteAt(bytes, x, row - 1, image.width);
+      final cr =
+          (row == 0 || x == 0) ? 0 : byteAt(bytes, x - 1, row - 1, image.width);
+      final xr = byteAt(bytes, x, row, image.width);
+      final pr = _paethPredictor(ar, br, cr);
+
+      out[oi++] = (xr - pr) & 0xff;
+    }
+
+    return oi;
+  }
+
   // Return the CRC of the bytes
   int _crc(String type, List<int> bytes) {
     final crc = getCrc32(type.codeUnits);
@@ -390,7 +445,8 @@ class PngEncoder extends Encoder {
   int sequenceNumber = 0;
   bool isAnimated = false;
   OutputBuffer? output;
-  Map<String,String>? textData;
+  Map<String, String>? textData;
+  late bool paletted;
 
   static const FILTER_NONE = 0;
   static const FILTER_SUB = 1;
